@@ -1,0 +1,71 @@
+name: Mirror pinned appimagetool
+
+on:
+  push:
+    branches:
+      - main
+      - automation/appimagetool-mirror
+    paths:
+      - 'manifests/appimagetool.json'
+      - '.github/workflows/mirror-appimagetool.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-appimagetool
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download, verify, and mirror pinned appimagetool
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          manifest='manifests/appimagetool.json'
+          upstream_repo="$(jq -r '.upstream.repository' "$manifest")"
+          upstream_asset_id="$(jq -r '.upstream.assetId' "$manifest")"
+          expected_sha256="$(jq -r '.upstream.sha256' "$manifest")"
+          expected_size="$(jq -r '.upstream.size' "$manifest")"
+          mirror_tag="$(jq -r '.mirror.tag' "$manifest")"
+          mirror_asset_name="$(jq -r '.mirror.assetName' "$manifest")"
+
+          [[ "$upstream_repo" == 'AppImage/appimagetool' ]]
+          [[ "$upstream_asset_id" =~ ^[0-9]+$ ]]
+          [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$expected_size" =~ ^[0-9]+$ ]]
+          [[ "$mirror_tag" == appimagetool-* ]]
+          [[ "$mirror_asset_name" == 'appimagetool-x86_64.AppImage' ]]
+
+          mkdir -p .mirror
+          destination=".mirror/$mirror_asset_name"
+
+          curl --fail --location --retry 3 --retry-all-errors             -H 'Accept: application/octet-stream'             -H 'X-GitHub-Api-Version: 2022-11-28'             "https://api.github.com/repos/$upstream_repo/releases/assets/$upstream_asset_id"             -o "$destination"
+
+          actual_size="$(stat -c '%s' "$destination")"
+          [[ "$actual_size" == "$expected_size" ]]
+          printf '%s  %s\n' "$expected_sha256" "$destination" | sha256sum --check -
+
+          if ! gh release view "$mirror_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$mirror_tag"               --repo "$GITHUB_REPOSITORY"               --target main               --title "DownKyi appimagetool $mirror_tag"               --notes-file "$manifest"               --draft
+            gh release upload "$mirror_tag" "$destination" --repo "$GITHUB_REPOSITORY"
+            gh release edit "$mirror_tag" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi
+
+          release_json="$(gh api             -H 'Accept: application/vnd.github+json'             -H 'X-GitHub-Api-Version: 2026-03-10'             "repos/$GITHUB_REPOSITORY/releases/tags/$mirror_tag")"
+
+          jq -e '.immutable == true' <<<"$release_json" >/dev/null
+          asset_json="$(jq -c --arg name "$mirror_asset_name"             '.assets | map(select(.name == $name)) | if length == 1 then .[0] else error("expected exactly one mirrored asset") end'             <<<"$release_json")"
+
+          [[ "$(jq -r '.state' <<<"$asset_json")" == 'uploaded' ]]
+          [[ "$(jq -r '.size' <<<"$asset_json")" == "$expected_size" ]]
+          [[ "$(jq -r '.digest' <<<"$asset_json")" == "sha256:$expected_sha256" ]]
